@@ -1,0 +1,24 @@
+[general]
+db_path = ~/.claw-cost-daemon/events.db
+log_path = ~/.claw-cost-daemon/capture.log
+capture_mode = transparent
+
+[privacy]
+store_request_body = false
+store_response_body = false
+max_cmdline_length = 200
+
+[network]
+proxy_port = 8080
+block_quic = true
+
+[providers]
+# provider_name = domain_pattern1,domain_pattern2
+openrouter = openrouter.ai
+openai = api.openai.com
+anthropic = api.anthropic.com
+google = generativelanguage.googleapis.com
+
+[dashboard]
+refresh_interval_ms = 1000
+history_hours = 24
