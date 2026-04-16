@@ -2,281 +2,199 @@
 
 **Real-time AI API cost monitoring for Linux**
 
-Transparently intercepts outgoing AI API requests via mitmproxy, parses responses (including SSE streaming), calculates costs in real-time, attributes requests to local processes (PID/process name), and displays everything in a live terminal dashboard.
+Transparently intercepts AI API requests, calculates costs in real-time, attributes them to local processes, and displays everything in a live terminal dashboard.
+
+---
 
 ## 🚀 Quick Start
 
-### One-command start (recommended)
+### Installation (after `git clone`)
 
 ```bash
-# 1. Install
+# 1. Clone the repo
+git clone https://github.com/Cachet23/claw-cost-daemon.git
 cd claw-cost-daemon
+
+# 2. Create a virtual environment
+python3 -m venv .venv
+
+# 3. Activate the venv
+source .venv/bin/activate
+
+# 4. Install the package in editable mode
 pip install -e .
-
-# 2. Run — does everything: network rules, CA cert, mitmproxy, dashboard
-sudo claw-cost-daemon start
-
-#    Press Ctrl+C to stop — network rules clean up automatically.
 ```
 
-That's it. `start` runs a 5-step setup (prerequisites → database → CA cert → network redirect → mitmproxy) and then launches the live dashboard. On exit it tears everything down.
+### Starting
 
-### Interactive setup wizard
+There are three useful operating modes. The key difference is:
+- `setup --network-scope openclaw` = recommended for OpenClaw + claw-code + Signal
+- `setup --network-scope system-ai-only` = transparent redirect only for known AI provider targets
+- `run --mode regular` = local proxy only, no automatic app integration
+- system-wide transparent redirect = captures almost everything, but can interfere with local daemons such as `signal-cli`
 
-For first-time setup with guided prompts and client integration (OpenClaw, claw-code):
+### Recommended: OpenClaw-Scoped Setup
+
+This is the right mode for a normal workstation running the OpenClaw gateway, `claw-code`, and Signal.
 
 ```bash
-sudo claw-cost-daemon setup
+sudo $(pwd)/.venv/bin/claw-cost-daemon setup --network-scope openclaw --non-interactive
 ```
 
-The wizard will:
-- Detect your user and home directory
-- Ask which apps to integrate (OpenClaw, claw-code)
-- Auto-detect port conflicts and suggest alternatives
-- Set up transparent proxy, CA cert, and network rules
-- Configure `NODE_EXTRA_CA_CERTS` for your chosen apps
-- Start mitmproxy and launch the dashboard
-
-### Manual / advanced usage
+Interactive setup is also available (recommended for first-time configuration):
 
 ```bash
-# Run diagnostics
-claw-cost-daemon doctor
-
-# Start mitmproxy capture only (foreground, transparent mode, needs root)
-sudo claw-cost-daemon run
-
-# Start mitmproxy in regular (explicit proxy) mode
-claw-cost-daemon run --mode regular
-
-# Open dashboard in a separate terminal
-claw-cost-daemon dashboard
-claw-cost-daemon dashboard --simple    # non-fullscreen mode
-
-# Export data
-claw-cost-daemon export csv
-claw-cost-daemon export json
-claw-cost-daemon export csv --since 24h
-
-# Stop everything (mitmproxy + network rules)
-sudo claw-cost-daemon stop
+sudo $(pwd)/.venv/bin/claw-cost-daemon setup
 ```
 
-## 📋 CLI Commands
+In interactive mode, setup now asks you to choose the capture scope first (`openclaw`, `system-ai-only`, or `system`) and shows a risk warning before enabling host-wide hard redirect.
+If Signal is detected as enabled in your OpenClaw config, setup warns you and offers to switch back to `openclaw` scope automatically.
 
-| Command | Description |
-|---------|-------------|
-| `sudo claw-cost-daemon start` | One-command start: network + CA cert + mitmproxy + dashboard |
-| `sudo claw-cost-daemon stop` | Stop mitmproxy and remove network rules |
-| `sudo claw-cost-daemon setup` | Interactive setup wizard with client integration |
-| `claw-cost-daemon doctor` | Run diagnostic checks |
-| `sudo claw-cost-daemon run` | Start mitmproxy capture (foreground) |
-| `claw-cost-daemon dashboard` | Live TUI dashboard |
-| `claw-cost-daemon dashboard --simple` | Simpler non-fullscreen mode |
-| `claw-cost-daemon export csv` | Export events as CSV |
-| `claw-cost-daemon export json` | Export events as JSON |
-| `claw-cost-daemon export csv --since 24h` | Export last 24h of events |
+What this does:
+- Starts `mitmproxy` on `127.0.0.1:9090`
+- Configures OpenClaw automatically via a systemd drop-in
+- Configures `claw-code` automatically via shell environment variables in `~/.bashrc`
+- Leaves `signal-cli` alone on `127.0.0.1:8080`
+- Does not enable a system-wide redirect
 
-## 🏗️ Architecture
+Important:
+- The OpenClaw gateway is reloaded immediately after setup
+- For `claw-code` in your current shell, you need to run `source ~/.bashrc` once or open a new terminal
+- In transparent scopes (`system-ai-only` / `system`), setup keeps OpenClaw `HTTP(S)_PROXY` unset (CA trust only) to avoid permanent breakage when the daemon is not running
 
-```
-┌──────────────────┐     nftables/iptables      ┌─────────────┐
-│   Any Process    │ ──── TCP 443 redirect ──── │  mitmproxy   │
-│  (claw-code,…)   │                            │  (port 8080) │
-└──────────────────┘                            └──────┬──────┘
-                                                      │
-                                              ┌───────▼──────┐
-                                              │ ai_capture   │
-                                              │ addon        │
-                                              └───────┬──────┘
-                                                      │
-                                    ┌─────────────────┼──────────────────┐
-                                    ▼                 ▼                  ▼
-                              ┌──────────┐    ┌─────────────┐    ┌──────────────┐
-                              │ Parser   │    │ Cost Engine │    │ Process      │
-                              │ (per     │    │ (pricing    │    │ Attribution  │
-                              │ provider)│    │  lookup)    │    │ (PID/cmdline)│
-                              └────┬─────┘    └──────┬──────┘    └──────┬───────┘
-                                   │                 │                  │
-                                   └─────────────────┼──────────────────┘
-                                                     ▼
-                                              ┌─────────────┐
-                                              │   SQLite    │
-                                              │  (events,   │
-                                              │   pricing,  │
-                                              │ dead_letter)│
-                                              └──────┬──────┘
-                                                     │
-                                              ┌──────▼──────┐
-                                              │  Dashboard  │
-                                              │  (Rich TUI) │
-                                              └─────────────┘
-```
+### Regular Mode
 
-### Key components
+This is only a local proxy. It is useful for testing or when you want to point specific apps at the proxy yourself.
 
-| Module | Purpose |
-|--------|---------|
-| `addons/ai_capture.py` | mitmproxy addon — intercepts AI API traffic, parses responses, calculates costs, streams SSE capture |
-| `parsers/providers.py` | Provider detection + response parsers (OpenAI, Anthropic, Google, OpenRouter + SSE streaming) |
-| `cost_engine.py` | Pricing lookup & cost calculation per model |
-| `storage.py` | SQLite persistence layer (events, pricing seed data, dead-letter queue) |
-| `dashboard.py` | Rich-based live terminal dashboard |
-| `network.py` | Transparent proxy setup in pure Python (nftables / iptables), CA cert management |
-| `process.py` | Process attribution via `/proc/net/tcp` inode scanning, `ss`, and `fuser` |
-| `lifecycle.py` | PID tracking, mitmproxy subprocess management, graceful shutdown |
-| `cli.py` | Click CLI entry point |
-
-## 📊 Dashboard
-
-The dashboard shows real-time data across four panels:
-
-```
-╭────────────────────── 💰 AI COST MONITOR ──────────────────────╮
-│ Session Total: $0.037500  (12 requests)                        │
-│ 🌐 OpenRouter Total: $0.025000 (8 reqs)                       │
-│ 🦀 OpenRouter × claw-code: $0.012500 (5 reqs)                 │
-╰───────────────────────────────────────────────────────────────╯
-
-  💰 Costs by Provider          📊 Costs by Model (Top 15)
-  ─────────────────────         ────────────────────────────
-  openrouter    $0.0250    8    openai/gpt-4o        $0.0150
-  openai        $0.0125    4    claude-3.5-sonnet     $0.0100
-
-  🖥️ Costs by Process           🕐 Recent Events (last 20)
-  ─────────────────────         ────────────────────────────
-  claw-code     $0.0125    5    3s ago  openrouter  $0.0025  200
-  opencode      $0.0100    3    5s ago  openai      $0.0015  200
-```
-
-## 🔧 Supported Providers
-
-| Provider | Domain | Parsed Fields |
-|----------|--------|---------------|
-| **OpenRouter** | `openrouter.ai` | model, prompt/completion tokens, native cost |
-| **OpenAI** | `api.openai.com` | model, prompt/completion tokens |
-| **Anthropic** | `api.anthropic.com` | model, input/output tokens, cache tokens |
-| **Google** | `generativelanguage.googleapis.com` | modelVersion, prompt/candidates tokens |
-
-All providers support **SSE streaming** responses. For OpenAI/OpenRouter, the addon automatically injects `stream_options.include_usage = true` to ensure token counts are reported in stream final chunks.
-
-## 💵 Pricing
-
-Pricing for 30+ popular models is seeded into the database on first run. Unknown models use conservative defaults ($3.00/$15.00 per 1M input/output tokens).
-
-Pricing can be updated programmatically:
-
-```python
-from claw_cost_daemon.cost_engine import CostEngine
-engine = CostEngine("~/.claw-cost-daemon/events.db")
-engine.update_pricing("openrouter", "new-model", input_price=1.0, output_price=3.0)
-```
-
-## 🦀 Process Attribution
-
-Every captured request is attributed to the local process that made it, using a three-strategy approach:
-
-1. **`ss`** — fastest, most reliable
-2. **`fuser`** — fallback
-3. **`/proc/net/tcp` inode scan** — slowest but most universal
-
-The dashboard specifically highlights:
-- **OpenRouter Total** — all OpenRouter costs
-- **OpenRouter × claw-code** — only OpenRouter requests from claw-code/OpenClaw processes
-
-## 🔧 Network Setup
-
-Transparent proxy rules are managed in pure Python (`network.py`) — no shell scripts needed at runtime.
-
-- **nftables** is preferred (modern Linux)
-- **iptables** is used as fallback
-- **QUIC (UDP 443)** is blocked to force TLS downgrade through the proxy
-- Rules are **idempotent** — safe to run setup/teardown repeatedly
-- All rules are cleaned up automatically on `Ctrl+C` or `claw-cost-daemon stop`
-
-### Client integration
-
-The `setup` wizard can automatically configure client apps:
-
-- **OpenClaw** — writes a systemd drop-in to set `NODE_EXTRA_CA_CERTS` and restarts the gateway service
-- **claw-code** — adds `NODE_EXTRA_CA_CERTS` to `~/.bashrc`
-
-## 🔒 Privacy & Security
-
-- **No prompt/response body storage** by default
-- Only metadata (provider, model, tokens, costs, PID, process name) is persisted
-- TLS interception requires trusting the mitmproxy CA certificate (handled automatically by `start`/`setup`)
-- CA cert permissions are fixed automatically when running under `sudo`
-- Apps with **certificate pinning** will fail — this is a known limitation
-- The dead-letter queue captures unparseable events for debugging
-
-## ⚠️ Troubleshooting
-
-### Run diagnostics
 ```bash
-claw-cost-daemon doctor
+.venv/bin/claw-cost-daemon run --mode regular
 ```
 
-### mitmproxy CA not trusted
+Important:
+- This mode does not automatically capture all provider requests
+- It only captures traffic from processes that explicitly use `http://localhost:9090` as their proxy
+- If you only start `run --mode regular`, but OpenClaw and `claw-code` are not configured to use it, their traffic will not be visible
+
+### System AI-Only Transparent Mode
+
+This mode enables transparent interception while limiting redirects to resolved AI provider destinations.
+
 ```bash
-sudo cp ~/.mitmproxy/mitmproxy-ca-cert.pem /usr/local/share/ca-certificates/claw-cost-daemon-mitmproxy.crt
-sudo update-ca-certificates
-# Or on Arch: sudo trust anchor ~/.mitmproxy/mitmproxy-ca-cert.pem
+sudo $(pwd)/.venv/bin/claw-cost-daemon setup --network-scope system-ai-only
 ```
 
-### Certificate pinning errors
-Some apps (Chrome, Firefox) pin certificates and will show SSL errors. This is expected with MITM. The captured traffic from apps that don't pin (curl, Python requests, claw-code) will still work.
+What this does:
+- Installs nftables/iptables redirect rules only for known AI provider destination IPs
+- Blocks QUIC only for those provider destination targets
+- Runs in transparent mode with less collateral impact than full system mode
+- Keeps OpenClaw `HTTP(S)_PROXY` unset (CA trust only), so OpenClaw is not permanently tied to a local proxy listener
 
-### No events showing
-1. Verify network rules are active: `sudo nft list tables` or `sudo iptables -t nat -L`
-2. Check mitmproxy is running: `ps aux | grep mitmdump`
-3. Verify CA cert is trusted by the target app
-4. Check dead_letter table for parse errors: `sqlite3 ~/.claw-cost-daemon/events.db "SELECT * FROM dead_letter"`
+Tradeoff:
+- Coverage depends on DNS/IP resolution at setup time
+- Provider edge IPs can change; rerun setup if capture coverage drops
 
-### Test with explicit proxy mode
-If transparent mode isn't working, test with explicit proxy:
+### System-Wide Transparent Mode
+
+This is the aggressive mode for maximum automatic capture across the entire host.
+
 ```bash
-claw-cost-daemon run --mode regular
-# In another terminal:
-export https_proxy=http://127.0.0.1:8080
-curl https://api.openai.com/v1/models
+sudo $(pwd)/.venv/bin/claw-cost-daemon setup --network-scope system
 ```
 
-### Reset everything
+What this does:
+- Installs an nftables/iptables redirect for outbound TCP/443 traffic
+- Blocks QUIC so HTTPS flows through the proxy
+- Captures a very large amount of traffic automatically
+
+Risk:
+- Can interfere with local TLS and daemon-based setups
+- In particular, `signal-cli` can break in this mode
+- That is why this mode is not the default for OpenClaw workstations
+
+Signal note:
+- If interactive setup detects an enabled Signal channel, it prompts for confirmation before keeping hard redirect.
+- If you do not explicitly confirm, setup falls back to `openclaw` scope.
+
+### Which Option Should I Use?
+
+- OpenClaw + `claw-code` + Signal on the same machine: `setup --network-scope openclaw`
+- Broader transparent capture while reducing non-AI side effects: `setup --network-scope system-ai-only`
+- Local testing with a manually configured proxy only: `run --mode regular`
+- Maximum host-wide capture where Signal does not matter or is isolated: `setup --network-scope system`
+
+### Stopping
+
+**In the terminal:** `Ctrl+C`
+
+**Or via command:**
 ```bash
-sudo claw-cost-daemon stop
-rm -rf ~/.claw-cost-daemon/events.db
+sudo pkill -f mitmdump
+sudo pkill -f claw-cost-daemon
 ```
 
-## 📁 Project Structure
+### Troubleshooting
 
-```
-claw-cost-daemon/
-├── config/
-│   └── default.toml          # Default configuration
-├── scripts/
-│   ├── setup-network.sh      # Legacy (replaced by network.py)
-│   └── teardown-network.sh   # Legacy (replaced by network.py)
-├── src/claw_cost_daemon/
-│   ├── __init__.py
-│   ├── cli.py                # Click CLI entry point
-│   ├── storage.py            # SQLite persistence + pricing seed
-│   ├── cost_engine.py        # Cost calculation engine
-│   ├── process.py            # PID/process attribution (ss/fuser/proc)
-│   ├── network.py            # Transparent proxy + CA cert (pure Python)
-│   ├── lifecycle.py          # PID tracking, graceful shutdown
-│   ├── dashboard.py          # Rich-based TUI dashboard
-│   ├── addons/
-│   │   └── ai_capture.py     # mitmproxy addon (core capture + SSE)
-│   └── parsers/
-│       └── providers.py      # Provider detection + response parsing
-├── tests/
-│   ├── test_parsers.py
-│   └── test_storage_cost.py
-├── pyproject.toml
-└── requirements.txt
+**Port 9090 is already in use:**
+```bash
+# Kill the old process
+sudo pkill -f mitmdump
+
+# Or use another port
+sudo $(pwd)/.venv/bin/claw-cost-daemon run --port 19090 --mode transparent
 ```
 
-## License
+**Important for OpenClaw + Signal:**
+- `signal-cli` often uses `127.0.0.1:8080` as its daemon port
+- That is why `claw-cost-daemon` defaults to `9090`
+- By default, `setup` uses `--network-scope openclaw` and automatically sets `HTTP(S)_PROXY` for the OpenClaw gateway service and for new `claw-code` shells, instead of transparently redirecting the whole host
+- For transparent interception that focuses on AI providers only, use: `sudo $(pwd)/.venv/bin/claw-cost-daemon setup --network-scope system-ai-only`
+- If you really want system-wide interception, use: `sudo $(pwd)/.venv/bin/claw-cost-daemon setup --network-scope system`
 
-MIT
+**"Command not found" with sudo:**
+Always use the absolute path:
+```bash
+sudo $(pwd)/.venv/bin/claw-cost-daemon run
+# NOT: sudo claw-cost-daemon run (this will not work)
+```
+
+---
+
+## 🛠️ Development
+
+### Adding Dependencies
+
+```bash
+# In the activated venv
+pip install <package>
+pip freeze > requirements.txt
+git add requirements.txt
+git commit -m "Add: <package>"
+```
+
+### Code Changes
+
+Because `pip install -e .` is used, changes are active immediately:
+```bash
+# Edit src/claw_cost_daemon/...
+# Then test directly:
+claw-cost-daemon --help
+```
+
+### Branches
+
+- `main` – Stable version
+- `dev` – Development
+
+---
+
+## 📋 Requirements
+
+- Python 3.10+
+- Linux (for transparent mode)
+- Root privileges (only for transparent mode)
+
+---
+
+## 🔗 GitHub
+
+https://github.com/Cachet23/claw-cost-daemon

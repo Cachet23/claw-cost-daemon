@@ -17,6 +17,7 @@ import sys
 import json
 import csv
 import time
+import atexit
 import socket
 import platform
 import subprocess
@@ -45,8 +46,10 @@ from claw_cost_daemon.lifecycle import (
 )
 
 DEFAULT_DB = "~/.claw-cost-daemon/events.db"
-DEFAULT_PROXY_PORT = 8080
+DEFAULT_PROXY_PORT = 9090  # Changed from 8080 to avoid conflicts with signal-cli
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent.parent / "scripts"
+SAFE_PROXY_PORT_CANDIDATES = [9090, 19090, 28080, 10080]
+SETUP_LOCK_FILE = Path("/tmp/claw-cost-daemon-setup.lock")
 
 # The bin directory where this script (or the entry-point wrapper) lives.
 # Under `sudo` the venv is NOT on PATH, so we need to look here explicitly.
@@ -93,6 +96,14 @@ def _is_port_in_use(port: int) -> bool:
         sock.close()
 
 
+def _pick_free_port(candidates: list[int], fallback: int) -> int:
+    """Pick first free port from candidates, otherwise use fallback."""
+    for candidate in candidates:
+        if not _is_port_in_use(candidate):
+            return candidate
+    return fallback
+
+
 def _ensure_line_in_file(path: Path, line: str) -> bool:
     """Append line to file only when missing. Returns True if changed."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -111,6 +122,36 @@ def _ensure_line_in_file(path: Path, line: str) -> bool:
     return True
 
 
+def _upsert_managed_block(path: Path, block_name: str, body: str) -> bool:
+    """Insert or replace a named managed block in a text file."""
+    start_marker = f"# >>> {block_name} >>>"
+    end_marker = f"# <<< {block_name} <<<"
+    block = f"{start_marker}\n{body.rstrip()}\n{end_marker}\n"
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    content = path.read_text(encoding="utf-8") if path.exists() else ""
+
+    if start_marker in content and end_marker in content:
+        start_idx = content.index(start_marker)
+        end_idx = content.index(end_marker, start_idx) + len(end_marker)
+        if end_idx < len(content) and content[end_idx:end_idx + 1] == "\n":
+            end_idx += 1
+        new_content = content[:start_idx] + block + content[end_idx:]
+    else:
+        new_content = content
+        if new_content and not new_content.endswith("\n"):
+            new_content += "\n"
+        if new_content:
+            new_content += "\n"
+        new_content += block
+
+    if new_content == content:
+        return False
+
+    path.write_text(new_content, encoding="utf-8")
+    return True
+
+
 def _run_user_systemctl(user: str, uid: int, args: list[str]) -> subprocess.CompletedProcess:
     """Run a user-level systemctl command as the invoking non-root user."""
     cmd = [
@@ -122,6 +163,83 @@ def _run_user_systemctl(user: str, uid: int, args: list[str]) -> subprocess.Comp
         *args,
     ]
     return subprocess.run(cmd, capture_output=True, text=True, check=False)
+
+
+def _detect_signal_channel(home: Path) -> dict[str, object]:
+    """Inspect local OpenClaw config for Signal channel status."""
+    cfg_path = home / ".openclaw" / "openclaw.json"
+    result: dict[str, object] = {
+        "detected": False,
+        "enabled": False,
+        "account": None,
+        "endpoint": None,
+    }
+
+    if not cfg_path.exists():
+        return result
+
+    try:
+        data = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return result
+
+    channels = data.get("channels") if isinstance(data, dict) else None
+    signal = channels.get("signal") if isinstance(channels, dict) else None
+    if not isinstance(signal, dict):
+        return result
+
+    result["detected"] = True
+    result["enabled"] = bool(signal.get("enabled"))
+    result["account"] = signal.get("account")
+
+    if isinstance(signal.get("httpUrl"), str) and signal.get("httpUrl"):
+        result["endpoint"] = signal.get("httpUrl")
+    else:
+        host = signal.get("httpHost") or "127.0.0.1"
+        port = signal.get("httpPort") or 8080
+        result["endpoint"] = f"http://{host}:{port}"
+
+    return result
+
+
+def _acquire_setup_lock() -> None:
+    """Prevent concurrent setup wizards from running simultaneously."""
+    current_pid = os.getpid()
+
+    if SETUP_LOCK_FILE.exists():
+        try:
+            existing_pid = int(SETUP_LOCK_FILE.read_text(encoding="utf-8").strip())
+        except (ValueError, OSError):
+            existing_pid = 0
+
+        if existing_pid > 0:
+            try:
+                os.kill(existing_pid, 0)
+            except ProcessLookupError:
+                # Stale lock from dead process.
+                SETUP_LOCK_FILE.unlink(missing_ok=True)
+            except PermissionError:
+                raise click.ClickException(
+                    f"another setup appears active (pid {existing_pid}); stop it first"
+                )
+            else:
+                if existing_pid != current_pid:
+                    raise click.ClickException(
+                        f"another setup is already running (pid {existing_pid}); stop it first"
+                    )
+
+    SETUP_LOCK_FILE.write_text(str(current_pid), encoding="utf-8")
+
+    def _cleanup_lock() -> None:
+        try:
+            if SETUP_LOCK_FILE.exists():
+                owner = int(SETUP_LOCK_FILE.read_text(encoding="utf-8").strip())
+                if owner == current_pid:
+                    SETUP_LOCK_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    atexit.register(_cleanup_lock)
 
 
 @click.group()
@@ -247,9 +365,32 @@ def start(ctx: click.Context, port: int):
 @cli.command("setup")
 @click.option("--port", default=None, type=int, help="Proxy listen port (auto-prompt if omitted)")
 @click.option("--non-interactive", is_flag=True, help="Use defaults without prompts")
+@click.option(
+    "--network-scope",
+    type=click.Choice(["openclaw", "system-ai-only", "system"]),
+    default="openclaw",
+    show_default=True,
+    help="openclaw=proxy OpenClaw only, system-ai-only=transparent redirect for AI provider targets, system=redirect all apps",
+)
+@click.option(
+    "--daemon",
+    is_flag=True,
+    help="Deprecated alias. Setup already runs proxy in background and dashboard in foreground.",
+)
 @click.pass_context
-def setup_wizard(ctx: click.Context, port: int | None, non_interactive: bool):
-    """🧭 Interactive Linux-only setup wizard for monitor + client integration."""
+def setup_wizard(
+    ctx: click.Context,
+    port: int | None,
+    non_interactive: bool,
+    network_scope: str,
+    daemon: bool,
+):
+    """🧭 Interactive Linux-only setup wizard for monitor + client integration.
+
+    Default mode uses app-level proxying for OpenClaw to avoid breaking unrelated
+    TLS clients (for example signal-cli). Use --network-scope system-ai-only or
+    --network-scope system when you intentionally want transparent interception.
+    """
     if platform.system().lower() != "linux":
         click.echo("❌ setup is Linux-only.")
         sys.exit(1)
@@ -257,6 +398,8 @@ def setup_wizard(ctx: click.Context, port: int | None, non_interactive: bool):
     if os.geteuid() != 0:
         click.echo("❌ setup requires root. Use: sudo claw-cost-daemon setup")
         sys.exit(1)
+
+    _acquire_setup_lock()
 
     db = ctx.obj["db"]
     real_user, real_home, real_uid = _real_user_context()
@@ -266,25 +409,91 @@ def setup_wizard(ctx: click.Context, port: int | None, non_interactive: bool):
     click.echo("=" * 50)
     click.echo(f"Detected user: {real_user} ({real_home})")
 
+    signal_status = _detect_signal_channel(real_home)
+
     if non_interactive:
         use_openclaw = True
         use_claw = True
     else:
-        click.echo("\nWhich apps should be integrated?")
-        use_openclaw = click.confirm("Use OpenClaw?", default=True)
-        use_claw = click.confirm("Use claw-code?", default=True)
+        click.echo("\nCapture scope:")
+        click.echo("  - openclaw: proxy OpenClaw and configured tooling only (recommended)")
+        click.echo("  - system-ai-only: transparent redirect only for known AI provider targets")
+        click.echo("  - system: host-wide transparent redirect (aggressive)")
+        network_scope = click.prompt(
+            "Choose capture scope",
+            type=click.Choice(["openclaw", "system-ai-only", "system"]),
+            default=network_scope,
+            show_choices=False,
+        )
+
+        if network_scope in {"system-ai-only", "system"}:
+            if network_scope == "system-ai-only":
+                click.echo("\n⚠️  system-ai-only redirects HTTPS only for resolved AI provider targets.")
+                click.echo("   Coverage depends on DNS/IP resolution and can miss provider edge hosts.")
+            else:
+                click.echo("\n⚠️  System mode enables host-wide TCP/443 redirect.")
+                click.echo("   This captures most HTTPS traffic, but non-HTTP protocols can break.")
+
+        if network_scope == "system":
+            if bool(signal_status["enabled"]):
+                account = signal_status["account"] or "(unknown account)"
+                endpoint = signal_status["endpoint"] or "http://127.0.0.1:8080"
+                click.echo(
+                    f"   Detected Signal channel: enabled for {account} via {endpoint}."
+                )
+                click.echo("   Hard redirect may disrupt signal-cli transport.")
+                if not click.confirm("Keep system-wide hard redirect anyway?", default=False):
+                    network_scope = "openclaw"
+                    click.echo("   ✅ Switched to openclaw scope to protect Signal.")
+
+        click.echo("\nWhich integrations should be configured automatically?")
+        if network_scope in {"system-ai-only", "system"}:
+            use_openclaw = click.confirm(
+                "Configure OpenClaw gateway CA integration (no persistent proxy env)?",
+                default=True,
+            )
+            use_claw = click.confirm(
+                "Configure claw-code shell CA integration (no persistent proxy env)?",
+                default=True,
+            )
+        else:
+            use_openclaw = click.confirm("Configure OpenClaw gateway integration?", default=True)
+            use_claw = click.confirm("Configure claw-code shell integration?", default=True)
+
+        click.echo("\nSetup summary:")
+        click.echo(f"  - Capture scope: {network_scope}")
+        click.echo(f"  - Configure OpenClaw integration: {'yes' if use_openclaw else 'no'}")
+        click.echo(f"  - Configure claw-code integration: {'yes' if use_claw else 'no'}")
+        if not click.confirm("Continue with this setup?", default=True):
+            raise click.Abort()
 
     selected_port = port or DEFAULT_PROXY_PORT
     if port is None and _is_port_in_use(selected_port):
+        suggested = _pick_free_port(SAFE_PROXY_PORT_CANDIDATES, 10080)
         if non_interactive:
-            selected_port = 8081
+            selected_port = suggested
         else:
             click.echo(f"\n⚠️  Port {selected_port} is in use.")
-            suggested = 8081
             if click.confirm(f"Use port {suggested} instead?", default=True):
                 selected_port = suggested
             else:
                 selected_port = click.prompt("Enter proxy port", type=int, default=suggested)
+
+    # 8080 is commonly used by signal-cli in OpenClaw external-daemon mode.
+    if selected_port == 8080:
+        msg = (
+            "⚠️  Port 8080 is commonly used by signal-cli (OpenClaw Signal channel). "
+            "This can break Signal messaging while the cost daemon runs."
+        )
+        if non_interactive and port is None:
+            selected_port = _pick_free_port(SAFE_PROXY_PORT_CANDIDATES, 10080)
+            click.echo(f"\n{msg}")
+            click.echo(f"   Using safer port {selected_port} instead.")
+        elif not non_interactive:
+            click.echo(f"\n{msg}")
+            if click.confirm("Use a safer port automatically?", default=True):
+                selected_port = _pick_free_port(SAFE_PROXY_PORT_CANDIDATES, 10080)
+                click.echo(f"   ✅ Using {selected_port}")
 
     click.echo("\n📦 Step 1/6: Preparing database...")
     storage = Storage(db)
@@ -296,14 +505,21 @@ def setup_wizard(ctx: click.Context, port: int | None, non_interactive: bool):
     click.echo(f"   ✅ {cert}")
     click.echo(f"   {trust_ca_cert(cert)}")
 
-    click.echo("\n🌐 Step 3/6: Setting transparent redirect...")
-    net_msg = setup_network(selected_port)
-    click.echo(f"   ✅ {net_msg}")
-    active_port = get_active_redirect_port()
-    if active_port is not None and active_port != selected_port:
-        raise click.ClickException(
-            f"transparent redirect mismatch: expected :{selected_port}, found :{active_port}"
-        )
+    click.echo("\n🌐 Step 3/6: Configuring traffic routing...")
+    transparent_enabled = network_scope in {"system", "system-ai-only"}
+    if transparent_enabled:
+        net_msg = setup_network(selected_port, scope=network_scope)
+        click.echo(f"   ✅ {net_msg}")
+        active_port = get_active_redirect_port()
+        if active_port is not None and active_port != selected_port:
+            raise click.ClickException(
+                f"transparent redirect mismatch: expected :{selected_port}, found :{active_port}"
+            )
+        if network_scope == "system-ai-only":
+            click.echo("      Only known AI provider targets are redirected in this mode.")
+    else:
+        click.echo("   ✅ OpenClaw-only mode: no system-wide redirect rules")
+        click.echo("      This avoids interfering with signal-cli and other non-HTTP TLS clients.")
 
     click.echo("\n🧩 Step 4/6: Applying client integration...")
     openclaw_needs_restart = False
@@ -311,37 +527,81 @@ def setup_wizard(ctx: click.Context, port: int | None, non_interactive: bool):
         dropin_dir = real_home / ".config" / "systemd" / "user" / "openclaw-gateway.service.d"
         dropin_dir.mkdir(parents=True, exist_ok=True)
         dropin_file = dropin_dir / "10-claw-cost-daemon.conf"
-        dropin_file.write_text(
-            "[Service]\n"
-            f"Environment=NODE_EXTRA_CA_CERTS={cert}\n"
-            f"Environment=SSL_CERT_FILE={cert}\n"
-            "Environment=NO_PROXY=localhost,127.0.0.1,::1\n"
-            "Environment=no_proxy=localhost,127.0.0.1,::1\n",
-            encoding="utf-8",
-        )
+        dropin_lines = [
+            "[Service]",
+            f"Environment=NODE_EXTRA_CA_CERTS={cert}",
+            f"Environment=SSL_CERT_FILE={cert}",
+            "Environment=NO_PROXY=localhost,127.0.0.1,::1",
+            "Environment=no_proxy=localhost,127.0.0.1,::1",
+        ]
+        if transparent_enabled:
+            # In transparent modes we intentionally avoid persistent proxy env,
+            # so OpenClaw still works when claw-cost-daemon is not running.
+            dropin_lines.extend([
+                "Environment=HTTP_PROXY=",
+                "Environment=HTTPS_PROXY=",
+                "Environment=http_proxy=",
+                "Environment=https_proxy=",
+            ])
+        else:
+            dropin_lines.extend([
+                f"Environment=HTTP_PROXY=http://127.0.0.1:{selected_port}",
+                f"Environment=HTTPS_PROXY=http://127.0.0.1:{selected_port}",
+                f"Environment=http_proxy=http://127.0.0.1:{selected_port}",
+                f"Environment=https_proxy=http://127.0.0.1:{selected_port}",
+            ])
+        dropin_file.write_text("\n".join(dropin_lines) + "\n", encoding="utf-8")
         click.echo(f"   ✅ OpenClaw drop-in written: {dropin_file}")
-        click.echo("   ✅ OpenClaw env includes CA trust for transparent mode")
+        if transparent_enabled:
+            click.echo("   ✅ OpenClaw env keeps CA trust but leaves HTTP(S)_PROXY unset")
+            click.echo("      This avoids persistent proxy breakage when the daemon is not running.")
+        else:
+            click.echo(f"   ✅ OpenClaw env uses proxy http://127.0.0.1:{selected_port} + CA trust")
         openclaw_needs_restart = True
     else:
         click.echo("   • OpenClaw integration skipped")
 
     if use_claw:
         bashrc = real_home / ".bashrc"
-        changed = _ensure_line_in_file(
-            bashrc,
+        shell_lines = [
             f"export NODE_EXTRA_CA_CERTS={cert}",
+            f"export SSL_CERT_FILE={cert}",
+        ]
+        if not transparent_enabled:
+            proxy_url = f"http://127.0.0.1:{selected_port}"
+            shell_lines.extend([
+                f"export HTTP_PROXY={proxy_url}",
+                f"export HTTPS_PROXY={proxy_url}",
+                f"export http_proxy={proxy_url}",
+                f"export https_proxy={proxy_url}",
+                "export NO_PROXY=localhost,127.0.0.1,::1",
+                "export no_proxy=localhost,127.0.0.1,::1",
+            ])
+        changed = _upsert_managed_block(
+            bashrc,
+            "claw-cost-daemon shell",
+            "\n".join(shell_lines),
         )
         if changed:
-            click.echo(f"   ✅ Added NODE_EXTRA_CA_CERTS to {bashrc}")
+            click.echo(f"   ✅ Updated shell env in {bashrc} for claw-code")
         else:
-            click.echo("   ✅ claw env already configured in .bashrc")
+            click.echo("   ✅ claw shell env already configured in .bashrc")
+        if not transparent_enabled:
+            click.echo(f"   ✅ New shells will route claw-code via http://127.0.0.1:{selected_port}")
+            click.echo("      Run: source ~/.bashrc  (or open a new shell) before starting claw-code")
     else:
         click.echo("   • claw integration skipped")
 
     click.echo("\n🚀 Step 5/6: Starting mitmproxy...")
-    proc = start_mitmproxy(port=selected_port, db_path=db, confdir=cert.parent)
+    proc = start_mitmproxy(
+        port=selected_port,
+        db_path=db,
+        confdir=cert.parent,
+        transparent=transparent_enabled,
+    )
     write_pid(proc.pid)
-    click.echo(f"   ✅ mitmproxy running (PID {proc.pid}) on port {selected_port}")
+    mode_name = "transparent" if transparent_enabled else "regular (explicit proxy)"
+    click.echo(f"   ✅ mitmproxy running (PID {proc.pid}) on port {selected_port} [{mode_name}]")
 
     if openclaw_needs_restart:
         click.echo("   Reloading OpenClaw gateway to pick up proxy env...")
@@ -353,10 +613,18 @@ def setup_wizard(ctx: click.Context, port: int | None, non_interactive: bool):
             click.echo("   ⚠️  Could not restart openclaw-gateway.service automatically")
             click.echo("      Run: systemctl --user daemon-reload && systemctl --user restart openclaw-gateway.service")
 
+    # Always launch dashboard – daemon mode just means "don't ask questions"
     click.echo("\n📊 Step 6/6: Launching dashboard...")
-    click.echo("   Press Ctrl+C to stop and clean up network rules.")
+    click.echo("   Dashboard runs in foreground, proxy runs in background.")
+    if transparent_enabled:
+        click.echo("   Press Ctrl+C to stop both and clean up network rules.")
+    else:
+        click.echo("   Press Ctrl+C to stop both.")
+    if daemon:
+        click.echo("   ℹ️  --daemon is deprecated and has no effect in this version.")
     dash = Dashboard(db_path=db, refresh_ms=1000)
-    with GracefulShutdown(proc, teardown_network):
+    cleanup_fn = teardown_network if transparent_enabled else (lambda: "No transparent rules to remove.")
+    with GracefulShutdown(proc, cleanup_fn):
         try:
             dash.run()
         except KeyboardInterrupt:
