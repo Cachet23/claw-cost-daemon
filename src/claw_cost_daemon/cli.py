@@ -163,6 +163,43 @@ def _run_user_systemctl(user: str, uid: int, args: list[str]) -> subprocess.Comp
     return subprocess.run(cmd, capture_output=True, text=True, check=False)
 
 
+def _detect_signal_channel(home: Path) -> dict[str, object]:
+    """Inspect local OpenClaw config for Signal channel status."""
+    cfg_path = home / ".openclaw" / "openclaw.json"
+    result: dict[str, object] = {
+        "detected": False,
+        "enabled": False,
+        "account": None,
+        "endpoint": None,
+    }
+
+    if not cfg_path.exists():
+        return result
+
+    try:
+        data = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return result
+
+    channels = data.get("channels") if isinstance(data, dict) else None
+    signal = channels.get("signal") if isinstance(channels, dict) else None
+    if not isinstance(signal, dict):
+        return result
+
+    result["detected"] = True
+    result["enabled"] = bool(signal.get("enabled"))
+    result["account"] = signal.get("account")
+
+    if isinstance(signal.get("httpUrl"), str) and signal.get("httpUrl"):
+        result["endpoint"] = signal.get("httpUrl")
+    else:
+        host = signal.get("httpHost") or "127.0.0.1"
+        port = signal.get("httpPort") or 8080
+        result["endpoint"] = f"http://{host}:{port}"
+
+    return result
+
+
 @click.group()
 @click.version_option(__version__, prog_name="claw-cost-daemon")
 @click.option("--db", default=DEFAULT_DB, help="SQLite database path")
@@ -328,13 +365,47 @@ def setup_wizard(
     click.echo("=" * 50)
     click.echo(f"Detected user: {real_user} ({real_home})")
 
+    signal_status = _detect_signal_channel(real_home)
+
     if non_interactive:
         use_openclaw = True
         use_claw = True
     else:
-        click.echo("\nWhich apps should be integrated?")
-        use_openclaw = click.confirm("Use OpenClaw?", default=True)
-        use_claw = click.confirm("Use claw-code?", default=True)
+        click.echo("\nCapture scope:")
+        click.echo("  - openclaw: proxy OpenClaw and configured tooling only (recommended)")
+        click.echo("  - system: host-wide transparent redirect (aggressive)")
+        network_scope = click.prompt(
+            "Choose capture scope",
+            type=click.Choice(["openclaw", "system"]),
+            default=network_scope,
+            show_choices=False,
+        )
+
+        if network_scope == "system":
+            click.echo("\n⚠️  System mode enables host-wide TCP/443 redirect.")
+            click.echo("   This captures most HTTPS traffic, but non-HTTP protocols can break.")
+
+            if bool(signal_status["enabled"]):
+                account = signal_status["account"] or "(unknown account)"
+                endpoint = signal_status["endpoint"] or "http://127.0.0.1:8080"
+                click.echo(
+                    f"   Detected Signal channel: enabled for {account} via {endpoint}."
+                )
+                click.echo("   Hard redirect may disrupt signal-cli transport.")
+                if not click.confirm("Keep system-wide hard redirect anyway?", default=False):
+                    network_scope = "openclaw"
+                    click.echo("   ✅ Switched to openclaw scope to protect Signal.")
+
+        click.echo("\nWhich integrations should be configured automatically?")
+        use_openclaw = click.confirm("Configure OpenClaw gateway integration?", default=True)
+        use_claw = click.confirm("Configure claw-code shell integration?", default=True)
+
+        click.echo("\nSetup summary:")
+        click.echo(f"  - Capture scope: {network_scope}")
+        click.echo(f"  - Configure OpenClaw integration: {'yes' if use_openclaw else 'no'}")
+        click.echo(f"  - Configure claw-code integration: {'yes' if use_claw else 'no'}")
+        if not click.confirm("Continue with this setup?", default=True):
+            raise click.Abort()
 
     selected_port = port or DEFAULT_PROXY_PORT
     if port is None and _is_port_in_use(selected_port):

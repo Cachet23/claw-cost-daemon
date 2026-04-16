@@ -8,155 +8,168 @@ Transparently intercepts AI API requests, calculates costs in real-time, attribu
 
 ## 🚀 Quick Start
 
-### Installation (nach `git clone`)
+### Installation (after `git clone`)
 
 ```bash
-# 1. Repo klonen
+# 1. Clone the repo
 git clone https://github.com/Cachet23/claw-cost-daemon.git
 cd claw-cost-daemon
 
-# 2. Virtuelle Umgebung erstellen
+# 2. Create a virtual environment
 python3 -m venv .venv
 
-# 3. venv aktivieren
+# 3. Activate the venv
 source .venv/bin/activate
 
-# 4. Package installieren (editable für Entwicklung)
+# 4. Install the package in editable mode
 pip install -e .
 ```
 
-### Starten
+### Starting
 
-Es gibt drei sinnvolle Betriebsarten. Der wichtige Unterschied ist:
-- `setup --network-scope openclaw` = empfohlen fuer OpenClaw + claw-code + Signal
-- `run --mode regular` = nur lokaler Proxy, keine automatische App-Integration
-- systemweiter transparenter Redirect = faengt fast alles ab, kann aber lokale Daemons wie `signal-cli` stoeren
+There are three useful operating modes. The key difference is:
+- `setup --network-scope openclaw` = recommended for OpenClaw + claw-code + Signal
+- `run --mode regular` = local proxy only, no automatic app integration
+- system-wide transparent redirect = captures almost everything, but can interfere with local daemons such as `signal-cli`
 
-### Empfohlen: OpenClaw-Scoped Setup
+### Recommended: OpenClaw-Scoped Setup
 
-Das ist der Modus fuer deinen normalen Rechner mit OpenClaw Gateway, `claw-code` und Signal.
+This is the right mode for a normal workstation running the OpenClaw gateway, `claw-code`, and Signal.
 
 ```bash
 sudo $(pwd)/.venv/bin/claw-cost-daemon setup --network-scope openclaw --non-interactive
 ```
 
-Was dabei passiert:
-- Startet `mitmproxy` auf `127.0.0.1:9090`
-- Konfiguriert OpenClaw automatisch per systemd drop-in
-- Konfiguriert `claw-code` automatisch per Shell-Env in `~/.bashrc`
-- Lässt `signal-cli` auf `127.0.0.1:8080` in Ruhe
-- Verwendet keinen systemweiten Redirect
+Interactive setup is also available (recommended for first-time configuration):
 
-Wichtig:
-- OpenClaw-Gateway wird direkt nach dem Setup neu geladen
-- Fuer `claw-code` in der aktuellen Shell brauchst du danach einmal `source ~/.bashrc` oder ein neues Terminal
+```bash
+sudo $(pwd)/.venv/bin/claw-cost-daemon setup
+```
+
+In interactive mode, setup now asks you to choose the capture scope first (`openclaw` or `system`) and shows a risk warning before enabling host-wide hard redirect.
+If Signal is detected as enabled in your OpenClaw config, setup warns you and offers to switch back to `openclaw` scope automatically.
+
+What this does:
+- Starts `mitmproxy` on `127.0.0.1:9090`
+- Configures OpenClaw automatically via a systemd drop-in
+- Configures `claw-code` automatically via shell environment variables in `~/.bashrc`
+- Leaves `signal-cli` alone on `127.0.0.1:8080`
+- Does not enable a system-wide redirect
+
+Important:
+- The OpenClaw gateway is reloaded immediately after setup
+- For `claw-code` in your current shell, you need to run `source ~/.bashrc` once or open a new terminal
 
 ### Regular Mode
 
-Das ist nur ein lokaler Proxy. Er eignet sich fuer Tests oder wenn du selbst ganz gezielt Apps auf den Proxy zeigen lassen willst.
+This is only a local proxy. It is useful for testing or when you want to point specific apps at the proxy yourself.
 
 ```bash
 .venv/bin/claw-cost-daemon run --mode regular
 ```
 
-Wichtig:
-- Dieser Modus faengt nicht automatisch alle Provider-Requests ab
-- Er erfasst nur Traffic von Prozessen, die explizit `http://localhost:9090` als Proxy benutzen
-- Wenn du nur `run --mode regular` startest, aber OpenClaw und `claw-code` nicht darauf konfiguriert sind, wird ihr Traffic nicht gesehen
+Important:
+- This mode does not automatically capture all provider requests
+- It only captures traffic from processes that explicitly use `http://localhost:9090` as their proxy
+- If you only start `run --mode regular`, but OpenClaw and `claw-code` are not configured to use it, their traffic will not be visible
 
-### Systemweiter transparenter Modus
+### System-Wide Transparent Mode
 
-Das ist der aggressive Modus fuer maximale automatische Erfassung auf dem gesamten Host.
+This is the aggressive mode for maximum automatic capture across the entire host.
 
 ```bash
 sudo $(pwd)/.venv/bin/claw-cost-daemon setup --network-scope system
 ```
 
-Was dabei passiert:
-- Setzt nftables/iptables Redirect fuer ausgehenden TCP/443
-- Blockiert QUIC, damit HTTPS ueber den Proxy geht
-- Faengt sehr viel Traffic automatisch ab
+What this does:
+- Installs an nftables/iptables redirect for outbound TCP/443 traffic
+- Blocks QUIC so HTTPS flows through the proxy
+- Captures a very large amount of traffic automatically
 
-Risiko:
-- Kann lokale TLS/Daemon-Setups stoeren
-- Insbesondere `signal-cli` kann dabei brechen
-- Deshalb ist dieser Modus nicht der Default fuer OpenClaw-Workstations
+Risk:
+- Can interfere with local TLS and daemon-based setups
+- In particular, `signal-cli` can break in this mode
+- That is why this mode is not the default for OpenClaw workstations
 
-### Welche Option sollte ich nehmen?
+Signal note:
+- If interactive setup detects an enabled Signal channel, it prompts for confirmation before keeping hard redirect.
+- If you do not explicitly confirm, setup falls back to `openclaw` scope.
 
-- OpenClaw + `claw-code` + Signal auf einem Rechner: `setup --network-scope openclaw`
-- Nur lokaler Test mit manuell gesetztem Proxy: `run --mode regular`
-- Maximale Host-weite Erfassung und Signal ist egal oder isoliert: `setup --network-scope system`
+### Which Option Should I Use?
 
-### Stoppen
+- OpenClaw + `claw-code` + Signal on the same machine: `setup --network-scope openclaw`
+- Local testing with a manually configured proxy only: `run --mode regular`
+- Maximum host-wide capture where Signal does not matter or is isolated: `setup --network-scope system`
 
-**Im Terminal:** `Ctrl+C`
+### Stopping
 
-**Oder per Command:**
+**In the terminal:** `Ctrl+C`
+
+**Or via command:**
 ```bash
 sudo pkill -f mitmdump
 sudo pkill -f claw-cost-daemon
 ```
 
-### Fehlerbehebung
+### Troubleshooting
 
-**Port 9090 bereits belegt:**
+**Port 9090 is already in use:**
 ```bash
-# Alten Prozess killen
+# Kill the old process
 sudo pkill -f mitmdump
 
-# Oder anderen Port verwenden
+# Or use another port
 sudo $(pwd)/.venv/bin/claw-cost-daemon run --port 19090 --mode transparent
 ```
 
-**Wichtig für OpenClaw + Signal:**
-- `signal-cli` nutzt oft `127.0.0.1:8080` als Daemon-Port.
-- Deshalb verwendet `claw-cost-daemon` standardmäßig `9090`.
-- `setup` nutzt standardmäßig `--network-scope openclaw` und setzt `HTTP(S)_PROXY` automatisch für den OpenClaw-Gateway-Service sowie für neue `claw-code`-Shells, statt den gesamten Host transparent umzuleiten.
-- Wenn du wirklich systemweit intercepten willst, nutze explizit: `sudo $(pwd)/.venv/bin/claw-cost-daemon setup --network-scope system`
+**Important for OpenClaw + Signal:**
+- `signal-cli` often uses `127.0.0.1:8080` as its daemon port
+- That is why `claw-cost-daemon` defaults to `9090`
+- By default, `setup` uses `--network-scope openclaw` and automatically sets `HTTP(S)_PROXY` for the OpenClaw gateway service and for new `claw-code` shells, instead of transparently redirecting the whole host
+- If you really want system-wide interception, use: `sudo $(pwd)/.venv/bin/claw-cost-daemon setup --network-scope system`
 
-**"Command not found" mit sudo:**
-Immer den absoluten Pfad verwenden:
+**"Command not found" with sudo:**
+Always use the absolute path:
 ```bash
 sudo $(pwd)/.venv/bin/claw-cost-daemon run
-# NICHT: sudo claw-cost-daemon run (funktioniert nicht!)
+# NOT: sudo claw-cost-daemon run (this will not work)
 ```
 
 ---
 
-## 🛠️ Entwicklung
+## 🛠️ Development
 
-### Dependencies hinzufügen
+### Adding Dependencies
 
 ```bash
-# Im aktivierten venv
+# In the activated venv
 pip install <package>
 pip freeze > requirements.txt
 git add requirements.txt
 git commit -m "Add: <package>"
 ```
 
-### Änderungen am Code
+### Code Changes
 
-Da `pip install -e .` verwendet wird, sind Änderungen sofort aktiv:
+Because `pip install -e .` is used, changes are active immediately:
 ```bash
 # Edit src/claw_cost_daemon/...
-# Dann direkt testen:
+# Then test directly:
 claw-cost-daemon --help
 ```
 
 ### Branches
 
-- `main` – Stabile Version
-- `dev` – Entwicklung
+- `main` – Stable version
+- `dev` – Development
 
 ---
 
-## 📋 Voraussetzungen
+## 📋 Requirements
 
 - Python 3.10+
-- Linux (für transparenten Modus)
-- Root-Rechte (nur für transparenten Modus)
+- Linux (for transparent mode)
+- Root privileges (only for transparent mode)
 
 ---
 
