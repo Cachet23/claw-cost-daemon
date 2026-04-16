@@ -87,6 +87,75 @@ def stop_mitmproxy() -> bool:
     return True
 
 
+def _find_stale_mitmdump_pids() -> list[int]:
+    """Find claw-cost-daemon mitmdump PIDs that may be left behind.
+
+    We match mitmdump processes running our addon script to avoid touching
+    unrelated mitmproxy sessions.
+    """
+    pids: list[int] = []
+    self_pid = os.getpid()
+
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == self_pid:
+            continue
+
+        cmdline_path = entry / "cmdline"
+        try:
+            raw = cmdline_path.read_bytes()
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+
+        if not raw:
+            continue
+
+        cmd = raw.replace(b"\x00", b" ").decode(errors="ignore")
+        if "mitmdump" not in cmd:
+            continue
+        if "claw_cost_daemon/addons/ai_capture.py" not in cmd:
+            continue
+        pids.append(pid)
+
+    return pids
+
+
+def _terminate_pids(pids: list[int], timeout_s: float = 5.0) -> None:
+    """Terminate a list of PIDs gracefully, then force-kill if needed."""
+    if not pids:
+        return
+
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            continue
+
+    deadline = time.time() + timeout_s
+    alive = set(pids)
+    while alive and time.time() < deadline:
+        time.sleep(0.1)
+        done: list[int] = []
+        for pid in alive:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                done.append(pid)
+            except PermissionError:
+                # Cannot probe further; assume alive and continue to deadline.
+                pass
+        for pid in done:
+            alive.discard(pid)
+
+    for pid in list(alive):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            continue
+
+
 def start_mitmproxy(
     port: int = 9090,
     db_path: str = "~/.claw-cost-daemon/events.db",
@@ -100,6 +169,14 @@ def start_mitmproxy(
     Returns the Popen object. Caller should use write_pid() to track it.
     """
     import shutil
+
+    # Ensure we never run multiple claw-cost-daemon mitmproxy instances in
+    # parallel. Multiple listeners frequently lead to port/rule mismatch.
+    stop_mitmproxy()
+    stale_pids = _find_stale_mitmdump_pids()
+    if stale_pids:
+        logger.warning("Cleaning up stale mitmdump instances: %s", stale_pids)
+        _terminate_pids(stale_pids)
 
     mitmdump = shutil.which("mitmdump")
     if not mitmdump:

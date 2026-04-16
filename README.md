@@ -29,6 +29,7 @@ pip install -e .
 
 There are three useful operating modes. The key difference is:
 - `setup --network-scope openclaw` = recommended for OpenClaw + claw-code + Signal
+- `setup --network-scope system-ai-only` = transparent redirect only for known AI provider targets
 - `run --mode regular` = local proxy only, no automatic app integration
 - system-wide transparent redirect = captures almost everything, but can interfere with local daemons such as `signal-cli`
 
@@ -46,7 +47,7 @@ Interactive setup is also available (recommended for first-time configuration):
 sudo $(pwd)/.venv/bin/claw-cost-daemon setup
 ```
 
-In interactive mode, setup now asks you to choose the capture scope first (`openclaw` or `system`) and shows a risk warning before enabling host-wide hard redirect.
+In interactive mode, setup now asks you to choose the capture scope first (`openclaw`, `system-ai-only`, or `system`) and shows a risk warning before enabling host-wide hard redirect.
 If Signal is detected as enabled in your OpenClaw config, setup warns you and offers to switch back to `openclaw` scope automatically.
 
 What this does:
@@ -59,6 +60,7 @@ What this does:
 Important:
 - The OpenClaw gateway is reloaded immediately after setup
 - For `claw-code` in your current shell, you need to run `source ~/.bashrc` once or open a new terminal
+- In transparent scopes (`system-ai-only` / `system`), setup keeps OpenClaw `HTTP(S)_PROXY` unset (CA trust only) to avoid permanent breakage when the daemon is not running
 
 ### Regular Mode
 
@@ -72,6 +74,24 @@ Important:
 - This mode does not automatically capture all provider requests
 - It only captures traffic from processes that explicitly use `http://localhost:9090` as their proxy
 - If you only start `run --mode regular`, but OpenClaw and `claw-code` are not configured to use it, their traffic will not be visible
+
+### System AI-Only Transparent Mode
+
+This mode enables transparent interception while limiting redirects to resolved AI provider destinations.
+
+```bash
+sudo $(pwd)/.venv/bin/claw-cost-daemon setup --network-scope system-ai-only
+```
+
+What this does:
+- Installs nftables/iptables redirect rules only for known AI provider destination IPs
+- Blocks QUIC only for those provider destination targets
+- Runs in transparent mode with less collateral impact than full system mode
+- Keeps OpenClaw `HTTP(S)_PROXY` unset (CA trust only), so OpenClaw is not permanently tied to a local proxy listener
+
+Tradeoff:
+- Coverage depends on DNS/IP resolution at setup time
+- Provider edge IPs can change; rerun setup if capture coverage drops
 
 ### System-Wide Transparent Mode
 
@@ -98,6 +118,7 @@ Signal note:
 ### Which Option Should I Use?
 
 - OpenClaw + `claw-code` + Signal on the same machine: `setup --network-scope openclaw`
+- Broader transparent capture while reducing non-AI side effects: `setup --network-scope system-ai-only`
 - Local testing with a manually configured proxy only: `run --mode regular`
 - Maximum host-wide capture where Signal does not matter or is isolated: `setup --network-scope system`
 
@@ -126,6 +147,7 @@ sudo $(pwd)/.venv/bin/claw-cost-daemon run --port 19090 --mode transparent
 - `signal-cli` often uses `127.0.0.1:8080` as its daemon port
 - That is why `claw-cost-daemon` defaults to `9090`
 - By default, `setup` uses `--network-scope openclaw` and automatically sets `HTTP(S)_PROXY` for the OpenClaw gateway service and for new `claw-code` shells, instead of transparently redirecting the whole host
+- For transparent interception that focuses on AI providers only, use: `sudo $(pwd)/.venv/bin/claw-cost-daemon setup --network-scope system-ai-only`
 - If you really want system-wide interception, use: `sudo $(pwd)/.venv/bin/claw-cost-daemon setup --network-scope system`
 
 **"Command not found" with sudo:**

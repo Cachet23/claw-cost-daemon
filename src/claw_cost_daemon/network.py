@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import os
 import pwd
+import socket
 import subprocess
 import shutil
 import sys
@@ -19,6 +20,12 @@ logger = logging.getLogger(__name__)
 TABLE_NAME = "claw-cost-daemon"
 TABLE_FILTER_NAME = "claw-cost-daemon-filter"
 MITM_UID = 0  # run as root so we skip mitmproxy's own UID
+DEFAULT_PROVIDER_DOMAINS = [
+    "openrouter.ai",
+    "api.openai.com",
+    "api.anthropic.com",
+    "generativelanguage.googleapis.com",
+]
 
 # The bin directory where the Python executable lives (venv).
 # Under `sudo` the venv is NOT on PATH, so we need to look here explicitly.
@@ -168,13 +175,35 @@ def trust_ca_cert(cert: Path) -> str | None:
     )
 
 
-def setup_network(port: int = 9090) -> str:
+def setup_network(
+    port: int = 9090,
+    scope: str = "system",
+    provider_domains: list[str] | None = None,
+) -> str:
     """Set up transparent proxy redirect rules. Idempotent.
 
     Returns a status message.
     """
     # Remove any stale rules first (idempotent)
     teardown_network()
+
+    if scope not in {"system", "system-ai-only"}:
+        raise RuntimeError(f"Unsupported network scope: {scope}")
+
+    if scope == "system-ai-only":
+        domains = provider_domains or DEFAULT_PROVIDER_DOMAINS
+        ipv4_addrs, ipv6_addrs, unresolved = _resolve_provider_ips(domains)
+        if not ipv4_addrs and not ipv6_addrs:
+            raise RuntimeError(
+                "system-ai-only could not resolve provider targets. "
+                "Check DNS/network and retry or use --network-scope openclaw/system."
+            )
+        if _has_nft():
+            return _setup_nft_ai_only(port, ipv4_addrs, ipv6_addrs, unresolved)
+        elif _has_iptables():
+            return _setup_iptables_ai_only(port, ipv4_addrs, ipv6_addrs, unresolved)
+        else:
+            raise RuntimeError("Neither nft nor iptables found – cannot set up network redirect")
 
     if _has_nft():
         return _setup_nft(port)
@@ -270,6 +299,121 @@ def _setup_nft(port: int) -> str:
     return " | ".join(messages)
 
 
+def _resolve_provider_ips(domains: list[str]) -> tuple[list[str], list[str], list[str]]:
+    """Resolve provider domains to IPv4/IPv6 destination lists."""
+    ipv4: set[str] = set()
+    ipv6: set[str] = set()
+    unresolved: list[str] = []
+
+    for domain in domains:
+        try:
+            infos = socket.getaddrinfo(domain, 443, proto=socket.IPPROTO_TCP)
+        except socket.gaierror:
+            unresolved.append(domain)
+            continue
+
+        got_any = False
+        for family, _, _, _, sockaddr in infos:
+            if family == socket.AF_INET:
+                ipv4.add(sockaddr[0])
+                got_any = True
+            elif family == socket.AF_INET6:
+                ipv6.add(sockaddr[0])
+                got_any = True
+
+        if not got_any:
+            unresolved.append(domain)
+
+    return sorted(ipv4), sorted(ipv6), unresolved
+
+
+def _add_nft_set_elements(table: str, set_name: str, elements: list[str]) -> None:
+    """Insert nft set members in manageable chunks."""
+    if not elements:
+        return
+    chunk_size = 64
+    for i in range(0, len(elements), chunk_size):
+        chunk = elements[i:i + chunk_size]
+        _run([
+            "nft", "add", "element", "inet", table, set_name,
+            "{", ",".join(chunk), "}",
+        ])
+
+
+def _setup_nft_ai_only(
+    port: int,
+    ipv4_addrs: list[str],
+    ipv6_addrs: list[str],
+    unresolved: list[str],
+) -> str:
+    """Set up nftables rules targeting only AI provider destination IPs."""
+    messages = []
+
+    _run(["nft", "add", "table", "inet", TABLE_NAME])
+    _run(["nft", "flush", "chain", "inet", TABLE_NAME, "output"])
+    _run([
+        "nft", "add", "chain", "inet", TABLE_NAME,
+        "output", "{", "type", "nat", "hook", "output", "priority", "-100", ";", "}",
+    ])
+
+    if ipv4_addrs:
+        _run(["nft", "add", "set", "inet", TABLE_NAME, "ai_ipv4", "{", "type", "ipv4_addr", ";", "}"])
+        _add_nft_set_elements(TABLE_NAME, "ai_ipv4", ipv4_addrs)
+        _run([
+            "nft", "add", "rule", "inet", TABLE_NAME, "output",
+            "ip", "daddr", "@ai_ipv4",
+            "tcp", "dport", "443",
+            "meta", "skuid", "!=", str(MITM_UID),
+            "redirect", "to", f":{port}",
+        ])
+
+    if ipv6_addrs:
+        _run(["nft", "add", "set", "inet", TABLE_NAME, "ai_ipv6", "{", "type", "ipv6_addr", ";", "}"])
+        _add_nft_set_elements(TABLE_NAME, "ai_ipv6", ipv6_addrs)
+        _run([
+            "nft", "add", "rule", "inet", TABLE_NAME, "output",
+            "ip6", "daddr", "@ai_ipv6",
+            "tcp", "dport", "443",
+            "meta", "skuid", "!=", str(MITM_UID),
+            "redirect", "to", f":{port}",
+        ])
+
+    messages.append(
+        f"nftables: AI-only TCP 443 redirect → :{port} (IPv4={len(ipv4_addrs)}, IPv6={len(ipv6_addrs)})"
+    )
+
+    _run(["nft", "add", "table", "inet", TABLE_FILTER_NAME])
+    _run(["nft", "flush", "chain", "inet", TABLE_FILTER_NAME, "output"])
+    _run([
+        "nft", "add", "chain", "inet", TABLE_FILTER_NAME,
+        "output", "{", "type", "filter", "hook", "output", "priority", "-100", ";", "}",
+    ])
+
+    if ipv4_addrs:
+        _run(["nft", "add", "set", "inet", TABLE_FILTER_NAME, "ai_ipv4", "{", "type", "ipv4_addr", ";", "}"])
+        _add_nft_set_elements(TABLE_FILTER_NAME, "ai_ipv4", ipv4_addrs)
+        _run([
+            "nft", "add", "rule", "inet", TABLE_FILTER_NAME, "output",
+            "ip", "daddr", "@ai_ipv4",
+            "udp", "dport", "443", "reject",
+        ])
+
+    if ipv6_addrs:
+        _run(["nft", "add", "set", "inet", TABLE_FILTER_NAME, "ai_ipv6", "{", "type", "ipv6_addr", ";", "}"])
+        _add_nft_set_elements(TABLE_FILTER_NAME, "ai_ipv6", ipv6_addrs)
+        _run([
+            "nft", "add", "rule", "inet", TABLE_FILTER_NAME, "output",
+            "ip6", "daddr", "@ai_ipv6",
+            "udp", "dport", "443", "reject",
+        ])
+
+    messages.append("nftables: AI-only QUIC block enabled")
+    if unresolved:
+        messages.append(f"unresolved providers: {', '.join(sorted(set(unresolved)))}")
+
+    return " | ".join(messages)
+
+
 def _setup_iptables(port: int) -> str:
     """Set up iptables rules (fallback)."""
     # Create chain
@@ -289,3 +433,58 @@ def _setup_iptables(port: int) -> str:
           "-j", "REJECT", "--reject-with", "icmp-port-unreachable"])
 
     return f"iptables: TCP 443 → :{port}, QUIC blocked"
+
+
+def _setup_iptables_ai_only(
+    port: int,
+    ipv4_addrs: list[str],
+    ipv6_addrs: list[str],
+    unresolved: list[str],
+) -> str:
+    """Set up iptables rules targeting only AI provider destination IPs."""
+    messages = []
+
+    _run(["iptables", "-t", "nat", "-N", "AI_COST_MONITOR"])
+    for ip in ipv4_addrs:
+        _run([
+            "iptables", "-t", "nat", "-A", "AI_COST_MONITOR",
+            "-p", "tcp", "-d", f"{ip}/32", "--dport", "443",
+            "-m", "owner", "!", "--uid-owner", str(MITM_UID),
+            "-j", "REDIRECT", "--to-port", str(port),
+        ])
+
+    _run(["iptables", "-t", "nat", "-A", "OUTPUT", "-j", "AI_COST_MONITOR"])
+
+    for ip in ipv4_addrs:
+        _run([
+            "iptables", "-A", "OUTPUT",
+            "-p", "udp", "-d", f"{ip}/32", "--dport", "443",
+            "-j", "REJECT", "--reject-with", "icmp-port-unreachable",
+        ])
+
+    if ipv6_addrs:
+        _run(["ip6tables", "-t", "nat", "-N", "AI_COST_MONITOR"])
+        for ip in ipv6_addrs:
+            _run([
+                "ip6tables", "-t", "nat", "-A", "AI_COST_MONITOR",
+                "-p", "tcp", "-d", ip, "--dport", "443",
+                "-m", "owner", "!", "--uid-owner", str(MITM_UID),
+                "-j", "REDIRECT", "--to-port", str(port),
+            ])
+        _run(["ip6tables", "-t", "nat", "-A", "OUTPUT", "-j", "AI_COST_MONITOR"])
+
+        for ip in ipv6_addrs:
+            _run([
+                "ip6tables", "-A", "OUTPUT",
+                "-p", "udp", "-d", ip, "--dport", "443",
+                "-j", "REJECT",
+            ])
+
+    messages.append(
+        f"iptables: AI-only TCP 443 redirect → :{port} (IPv4={len(ipv4_addrs)}, IPv6={len(ipv6_addrs)})"
+    )
+    messages.append("iptables: AI-only QUIC block enabled")
+    if unresolved:
+        messages.append(f"unresolved providers: {', '.join(sorted(set(unresolved)))}")
+
+    return " | ".join(messages)
