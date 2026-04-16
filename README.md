@@ -27,27 +27,66 @@ pip install -e .
 
 ### Starten
 
-**Option A: Transparenter Modus (empfohlen, benötigt root)**
-```bash
-sudo $(pwd)/.venv/bin/claw-cost-daemon run
-```
-- Interceptiert allen API-Traffic automatisch
-- Network rules werden automatisch gesetzt
-- CA-Zertifikat wird systemweit vertraut
+Es gibt drei sinnvolle Betriebsarten. Der wichtige Unterschied ist:
+- `setup --network-scope openclaw` = empfohlen fuer OpenClaw + claw-code + Signal
+- `run --mode regular` = nur lokaler Proxy, keine automatische App-Integration
+- systemweiter transparenter Redirect = faengt fast alles ab, kann aber lokale Daemons wie `signal-cli` stoeren
 
-**Option B: Setup-Wizard (erster Start)**
-```bash
-sudo $(pwd)/.venv/bin/claw-cost-daemon setup
-```
-- Führt durch 5 Schritte: Dependencies, DB, CA, Network Rules, Start
-- Fragt nach Integrationen (OpenClaw, claw-code, etc.)
+### Empfohlen: OpenClaw-Scoped Setup
 
-**Option C: Regularer Modus (ohne root)**
+Das ist der Modus fuer deinen normalen Rechner mit OpenClaw Gateway, `claw-code` und Signal.
+
+```bash
+sudo $(pwd)/.venv/bin/claw-cost-daemon setup --network-scope openclaw --non-interactive
+```
+
+Was dabei passiert:
+- Startet `mitmproxy` auf `127.0.0.1:9090`
+- Konfiguriert OpenClaw automatisch per systemd drop-in
+- Konfiguriert `claw-code` automatisch per Shell-Env in `~/.bashrc`
+- Lässt `signal-cli` auf `127.0.0.1:8080` in Ruhe
+- Verwendet keinen systemweiten Redirect
+
+Wichtig:
+- OpenClaw-Gateway wird direkt nach dem Setup neu geladen
+- Fuer `claw-code` in der aktuellen Shell brauchst du danach einmal `source ~/.bashrc` oder ein neues Terminal
+
+### Regular Mode
+
+Das ist nur ein lokaler Proxy. Er eignet sich fuer Tests oder wenn du selbst ganz gezielt Apps auf den Proxy zeigen lassen willst.
+
 ```bash
 .venv/bin/claw-cost-daemon run --mode regular
 ```
-- Apps müssen Proxy manuell konfigurieren (`http://localhost:8080`)
-- Gut für Testing ohne sudo
+
+Wichtig:
+- Dieser Modus faengt nicht automatisch alle Provider-Requests ab
+- Er erfasst nur Traffic von Prozessen, die explizit `http://localhost:9090` als Proxy benutzen
+- Wenn du nur `run --mode regular` startest, aber OpenClaw und `claw-code` nicht darauf konfiguriert sind, wird ihr Traffic nicht gesehen
+
+### Systemweiter transparenter Modus
+
+Das ist der aggressive Modus fuer maximale automatische Erfassung auf dem gesamten Host.
+
+```bash
+sudo $(pwd)/.venv/bin/claw-cost-daemon setup --network-scope system
+```
+
+Was dabei passiert:
+- Setzt nftables/iptables Redirect fuer ausgehenden TCP/443
+- Blockiert QUIC, damit HTTPS ueber den Proxy geht
+- Faengt sehr viel Traffic automatisch ab
+
+Risiko:
+- Kann lokale TLS/Daemon-Setups stoeren
+- Insbesondere `signal-cli` kann dabei brechen
+- Deshalb ist dieser Modus nicht der Default fuer OpenClaw-Workstations
+
+### Welche Option sollte ich nehmen?
+
+- OpenClaw + `claw-code` + Signal auf einem Rechner: `setup --network-scope openclaw`
+- Nur lokaler Test mit manuell gesetztem Proxy: `run --mode regular`
+- Maximale Host-weite Erfassung und Signal ist egal oder isoliert: `setup --network-scope system`
 
 ### Stoppen
 
@@ -61,14 +100,20 @@ sudo pkill -f claw-cost-daemon
 
 ### Fehlerbehebung
 
-**Port 8080 bereits belegt:**
+**Port 9090 bereits belegt:**
 ```bash
 # Alten Prozess killen
 sudo pkill -f mitmdump
 
 # Oder anderen Port verwenden
-sudo $(pwd)/.venv/bin/claw-cost-daemon run --mode transparent@8082
+sudo $(pwd)/.venv/bin/claw-cost-daemon run --port 19090 --mode transparent
 ```
+
+**Wichtig für OpenClaw + Signal:**
+- `signal-cli` nutzt oft `127.0.0.1:8080` als Daemon-Port.
+- Deshalb verwendet `claw-cost-daemon` standardmäßig `9090`.
+- `setup` nutzt standardmäßig `--network-scope openclaw` und setzt `HTTP(S)_PROXY` automatisch für den OpenClaw-Gateway-Service sowie für neue `claw-code`-Shells, statt den gesamten Host transparent umzuleiten.
+- Wenn du wirklich systemweit intercepten willst, nutze explizit: `sudo $(pwd)/.venv/bin/claw-cost-daemon setup --network-scope system`
 
 **"Command not found" mit sudo:**
 Immer den absoluten Pfad verwenden:

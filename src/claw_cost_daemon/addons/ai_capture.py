@@ -34,7 +34,7 @@ class AICaptureAddon:
 
     def __init__(self):
         self.db_path = Path("~/.claw-cost-daemon/events.db").expanduser()
-        self.proxy_port = 8080
+        self.proxy_port = 9090
         self.storage: Storage | None = None
         self.cost_engine: CostEngine | None = None
         self._session_start = time.time()

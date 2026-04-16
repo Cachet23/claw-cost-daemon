@@ -9,7 +9,7 @@ store_response_body = false
 max_cmdline_length = 200
 
 [network]
-proxy_port = 8080
+proxy_port = 9090
 block_quic = true
 
 [providers]

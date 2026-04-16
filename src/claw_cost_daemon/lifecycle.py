@@ -88,11 +88,12 @@ def stop_mitmproxy() -> bool:
 
 
 def start_mitmproxy(
-    port: int = 8080,
+    port: int = 9090,
     db_path: str = "~/.claw-cost-daemon/events.db",
     addon_path: Path | None = None,
     confdir: Path | None = None,
     env_extra: dict[str, str] | None = None,
+    transparent: bool = True,
 ) -> subprocess.Popen:
     """Start mitmproxy as a background subprocess.
 
@@ -124,8 +125,10 @@ def start_mitmproxy(
         "--set", "block_global=false",
         "--set", f"claw_cost_daemon_db_path={db_path}",
         "--set", f"claw_cost_daemon_proxy_port={port}",
-        "--mode", "transparent",
     ]
+
+    if transparent:
+        cmd.extend(["--mode", "transparent"])
 
     if confdir:
         cmd.extend(["--set", f"confdir={confdir}"])

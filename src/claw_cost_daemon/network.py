@@ -168,7 +168,7 @@ def trust_ca_cert(cert: Path) -> str | None:
     )
 
 
-def setup_network(port: int = 8080) -> str:
+def setup_network(port: int = 9090) -> str:
     """Set up transparent proxy redirect rules. Idempotent.
 
     Returns a status message.
